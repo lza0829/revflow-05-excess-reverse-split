@@ -26,7 +26,9 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
   booked_at TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT '待归并',
   note TEXT NOT NULL DEFAULT '',
-  settle_run_id INTEGER
+  settle_run_id INTEGER,
+  applied_cents INTEGER,
+  excess_cents INTEGER
 );
 CREATE TABLE IF NOT EXISTS quarantine_items (
   id INTEGER PRIMARY KEY,
@@ -35,7 +37,11 @@ CREATE TABLE IF NOT EXISTS quarantine_items (
   reason TEXT NOT NULL,
   amount_cents INTEGER NOT NULL,
   settle_run_id INTEGER NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  parent_entry_key TEXT NOT NULL DEFAULT '',
+  split_applied_cents INTEGER NOT NULL DEFAULT 0,
+  exposure_cents INTEGER NOT NULL DEFAULT 0,
+  split_kind TEXT NOT NULL DEFAULT '整笔'
 );
 CREATE TABLE IF NOT EXISTS settle_runs (
   id INTEGER PRIMARY KEY,
@@ -45,6 +51,9 @@ CREATE TABLE IF NOT EXISTS settle_runs (
   settled_count INTEGER NOT NULL DEFAULT 0,
   quarantine_count INTEGER NOT NULL DEFAULT 0,
   net_cents INTEGER NOT NULL DEFAULT 0,
+  applied_reversal_cents INTEGER NOT NULL DEFAULT 0,
+  excess_quarantine_cents INTEGER NOT NULL DEFAULT 0,
+  remaining_exposure_cents INTEGER NOT NULL DEFAULT 0,
   started_at TEXT NOT NULL,
   finished_at TEXT
 );
@@ -60,12 +69,54 @@ CREATE TABLE IF NOT EXISTS verify_reports (
 );
 """
 
+# 旧库升级：缺列时补列（新增库由 CREATE TABLE 直接带上）
+MIGRATIONS = {
+    "ledger_entries": {
+        "applied_cents": "INTEGER",
+        "excess_cents": "INTEGER",
+    },
+    "quarantine_items": {
+        "parent_entry_key": "TEXT NOT NULL DEFAULT ''",
+        "split_applied_cents": "INTEGER NOT NULL DEFAULT 0",
+        "exposure_cents": "INTEGER NOT NULL DEFAULT 0",
+        "split_kind": "TEXT NOT NULL DEFAULT '整笔'",
+    },
+    "settle_runs": {
+        "applied_reversal_cents": "INTEGER NOT NULL DEFAULT 0",
+        "excess_quarantine_cents": "INTEGER NOT NULL DEFAULT 0",
+        "remaining_exposure_cents": "INTEGER NOT NULL DEFAULT 0",
+    },
+}
+
+# 分栏一旦写入即不可变：防住「改了分栏却不动隔离行/余额」的旁路
+TRIGGERS = """
+CREATE TRIGGER IF NOT EXISTS ledger_split_immutable
+BEFORE UPDATE OF applied_cents, excess_cents ON ledger_entries
+WHEN OLD.applied_cents IS NOT NULL
+  AND (NEW.applied_cents IS NOT OLD.applied_cents
+       OR NEW.excess_cents IS NOT OLD.excess_cents)
+BEGIN
+  SELECT RAISE(ABORT, '冲正拆分分栏不可变');
+END;
+"""
+
+
+def _migrate(conn) -> None:
+    for table, columns in MIGRATIONS.items():
+        existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, decl in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
 
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
+        conn.executescript(TRIGGERS)
         n = conn.execute("SELECT COUNT(*) AS c FROM accounts").fetchone()["c"]
         if n:
+            conn.commit()
             return
         seed_path = FIXTURES_DIR / "seed.json"
         data = json.loads(Path(seed_path).read_text(encoding="utf-8"))
